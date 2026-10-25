@@ -14,6 +14,7 @@
 - 对话上下文：历史会话、关键决策、任务状态
 - 用户记忆：短期情景记忆 + 长期语义记忆（偏好、性格、画像）
 - 项目文件：资料与产物索引
+- **运行环境：项目依赖的工具链、系统包与启动方式（如 Rust/Cargo），用 Docker 镜像 + workspace 还原**
 - 权限：只记录引用，导入目标账号后重新绑定，**不跨账号复制权限**
 
 验收清单：
@@ -24,6 +25,10 @@
 4. 带口令 `unpack`：四层完整还原，校验和、签名全部通过
 5. `dbmig export` 生成目标账号官方导入入口可识别的本地导出目录
 6. 在飞书账号的豆包工作「设置 → 数据导入与同步」中完成导入，人工核对清单通过
+7. `dbmig pack --with-env` 能识别 Rust 项目并生成可构建的 Dockerfile / Compose
+8. 目标侧一条命令启动容器后能直接执行 Rust 脚本，输出与源项目一致
+
+> 验收优先级：先 M-B（Rust 环境可运行），再 M-A（Agent 数据/记忆）；最终两者合并为同一个迁移包。
 
 ## 2. 硬约束
 
@@ -66,8 +71,15 @@ episodic/data.json                # L1：sessions + episodic memories（明文�
 semantic/memories.jsonl.enc       # L2：语义记忆（AES-256-GCM 密文）
 procedural/assets.json            # L3：agent + workflows + procedural memories（明文）
 org/acl.json                      # L4：权限引用（copied=false）
-files/...                         # 项目文件原样保留
+compose.yaml                      # 目标侧一键启动环境
+env/Dockerfile                    # 运行环境镜像定义
+env/entrypoint.sh                 # 容器入口，默认执行项目的启动命令
+env/runtime.json                  # 探测结果：语言/版本/系统包/启动命令
+env/image.tar                     # 可选：docker save 的离线镜像（--with-image）
+files/...                         # 项目文件原样保留，同时作为 Docker 构建上下文
 ```
+
+`files/` 既是项目文件目录，也是 `compose.yaml` 的构建上下文和工作区挂载点，避免源码重复打包。
 
 `manifest.json` 关键字段：
 
@@ -206,3 +218,150 @@ testdata/sample_project/ 样例项目
 | 10 | goroutine / channel（选学） | 线程池 / BlockingQueue |
 
 节奏：一次只讲一个知识点 → 自己写脚本 → 我负责 `go build` / `go run` 检查并指出问题。
+
+## 13. 环境迁移子系统（2026-10-25 增补）
+
+### 13.1 迁移单元
+
+迁移单元 = Agent 数据 + 记忆 + 工作流 + **可运行环境**。环境不是附件，而是验收的一部分。
+
+### 13.2 环境探测
+
+| 源项目特征 | runtime | 基础镜像 |
+|---|---|---|
+| `rust-toolchain.toml` / `Cargo.toml` | rust | `rust:<pin>-slim` |
+| `package.json` | node | `node:<pin>-slim` |
+| `pyproject.toml` / `requirements.txt` | python | `python:<pin>-slim` |
+| 以上都没有 | generic | `debian:stable-slim` |
+
+规则：
+
+- 版本优先来自 `rust-toolchain.toml`、`package.json`、`.python-version`；没有就用稳定版，并写进 `runtime.json`
+- 有 lockfile 必须带上：`Cargo.lock`、`package-lock.json`、`poetry.lock`
+- 系统包写入 `runtime.json` 的 `apt_packages`，由 Dockerfile 安装
+- 探测结果落到 `env/runtime.json`，后续生成 Dockerfile/Compose 只读这份文件
+
+### 13.3 Rust 环境模板
+
+`env/Dockerfile`：
+
+```dockerfile
+FROM rust:1.83-slim
+WORKDIR /workspace
+COPY files/Cargo.toml files/Cargo.lock ./
+RUN cargo fetch
+COPY files/ ./
+RUN cargo build --release
+CMD ["cargo", "run", "--release"]
+```
+
+`compose.yaml`：
+
+```yaml
+services:
+  agent:
+    build:
+      context: .
+      dockerfile: env/Dockerfile
+    working_dir: /workspace
+    volumes:
+      - ./files:/workspace
+    command: ["cargo", "run", "--release"]
+```
+
+说明：
+
+- 镜像负责工具链，`files/` 负责代码；两者都在包里，目标机器不需要预装 Rust
+- 代码挂载进容器，迁移后仍可直接改脚本，不用每次重建镜像
+- `--with-image` 时额外执行 `docker save`，生成 `env/image.tar`，支持离线导入
+
+### 13.4 CLI 增补
+
+```text
+dbmig env detect -src <项目目录>                 # 只探测，输出 runtime.json
+dbmig env build  -src <项目目录> -tag <tag>      # 构建镜像 + 本地 smoke test
+dbmig pack       -src <项目目录> -out <包.dbm> [--with-env] [--with-image]
+dbmig env run    -in <包.dbm> -out <目录>        # unpack + compose build + 运行验收脚本
+```
+
+退出码补充：`4` 环境构建失败；`5` smoke test 失败。
+
+### 13.5 数据流
+
+```text
+源项目
+ ├─ Agent 数据 → 四层分类 → 加密 → .dbm
+ └─ 环境探测 → runtime.json → Dockerfile/Compose → build → smoke test
+                                             └─ 可选 docker save → env/image.tar
+                    ↓
+                 .dbm 迁移包
+                    ↓
+目标侧 unpack → docker compose build/up → 运行 Rust 脚本 → 输出比对
+```
+
+### 13.6 Rust 验收用例
+
+`testdata/sample_rust/`：
+
+```text
+rust-toolchain.toml
+Cargo.toml
+Cargo.lock
+src/main.rs        # 输出 hello from rust
+```
+
+验收步骤：
+
+1. `dbmig env detect -src testdata/sample_rust` 生成正确的 `runtime.json`
+2. `dbmig pack -src testdata/sample_rust -out rust.dbm --with-env --with-image`
+3. 目标机器只装 Docker，不装 Rust
+4. `dbmig env run -in rust.dbm -out restored`
+5. 输出 `hello from rust`，退出码 0
+
+判定：源项目和目标容器输出逐字节一致，即验收通过。
+
+### 13.7 密钥与 secret 边界
+
+- **secret 不进镜像层**：Docker 层会保留历史，`ENV` / `COPY` 的密钥无法真正删除
+- 运行期 secret 走 `--env-file`，或加密后放进 `env/secrets.enc`，由 `dbmig` 解密后注入
+- `.dockerignore` 排除 `.env`、`target/`、`*.pem`、`*.key`
+- 长期记忆仍按第 5 节信封加密；环境 secret 复用同一 KEK，但使用独立子密钥
+
+### 13.8 里程碑拆分
+
+| 里程碑 | 内容 | 验收 |
+|---|---|---|
+| M-B（先做） | Rust 环境探测、Dockerfile 生成、镜像构建、目标侧运行 | `hello from rust` |
+| M-A | Agent 数据/四层记忆 pack/inspect/unpack | 带口令完整还原 |
+| M-C | 合并成一个 `.dbm` + 官方导入 | 目标账号人工验收 |
+
+先做 M-B 的原因：验收标准是环境可运行，先把 Docker 链路跑通，避免 Go 代码写了却卡在平台/镜像能力上。
+
+### 13.9 目录规划增补
+
+```text
+internal/runtime/        语言与版本探测
+internal/docker/         Dockerfile/Compose 生成 + docker CLI 调用
+internal/envbundle/      环境打包、smoke test、镜像导入导出
+templates/               Dockerfile / compose 模板
+testdata/sample_rust/    Rust 验收样例
+```
+
+### 13.10 学习路线调整
+
+在原有 Go 课之后补两节：
+
+| 课 | 内容 | 用途 |
+|---|---|---|
+| 10 | `os/exec` + `flag` | 调用 `docker build/save/load/run`，解析命令行 |
+| 11 | `go test`（可选） | 给探测和打包逻辑写测试 |
+
+Docker 基础单独做一次实战，不计入 Go 课：只学 `Dockerfile`、`compose.yaml`、`docker build/run/save/load` 五个点。
+
+### 13.11 待确认
+
+1. 飞书账号里的豆包工作是否支持导入自定义 Docker 镜像或环境模板？
+2. 源项目环境能否拿到 Dockerfile/Compose；如果只有云端沙箱，能否导出快照或文件清单？
+3. 目标机器/沙箱是否允许运行 Docker？
+4. Rust 验收是 Cargo 项目（`cargo run`），还是单文件脚本（`rustc main.rs`）？
+5. 迁移包是否有大小限制，是否需要默认不打包镜像、只传 Dockerfile？
