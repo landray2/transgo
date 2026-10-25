@@ -28,7 +28,7 @@
 7. `dbmig pack --with-env` 能识别 Rust 项目并生成可构建的 Dockerfile / Compose
 8. 目标侧一条命令启动容器后能直接执行 Rust 脚本，输出与源项目一致
 
-> 验收优先级：先 M-B（Rust 环境可运行），再 M-A（Agent 数据/记忆）；最终两者合并为同一个迁移包。
+> 验收优先级（2026-10-25 确认）：先 M-A（Agent 数据/记忆），再 M-B（Rust 环境可运行）；最终两者合并为同一个迁移包。目标平台导入能力待实测，先做本地 Demo。
 
 ## 2. 硬约束
 
@@ -229,7 +229,8 @@ testdata/sample_project/ 样例项目
 
 | 源项目特征 | runtime | 基础镜像 |
 |---|---|---|
-| `rust-toolchain.toml` / `Cargo.toml` | rust | `rust:<pin>-slim` |
+| `rust-toolchain.toml` / `Cargo.toml` | rust-cargo | `rust:<pin>-slim` |
+| 只有 `.rs` 文件，无 `Cargo.toml` | rust-single | `rust:<pin>-slim`（`rustc` 编译单文件） |
 | `package.json` | node | `node:<pin>-slim` |
 | `pyproject.toml` / `requirements.txt` | python | `python:<pin>-slim` |
 | 以上都没有 | generic | `debian:stable-slim` |
@@ -275,6 +276,18 @@ services:
 - 代码挂载进容器，迁移后仍可直接改脚本，不用每次重建镜像
 - `--with-image` 时额外执行 `docker save`，生成 `env/image.tar`，支持离线导入
 
+只有单文件、没有 `Cargo.toml` 时，`runtime.json` 标记 `"mode": "single_file"`，Dockerfile 改为：
+
+```dockerfile
+FROM rust:1.83-slim
+WORKDIR /workspace
+COPY files/ ./
+RUN rustc main.rs -o /usr/local/bin/app
+CMD ["app"]
+```
+
+对应 Compose 的 `command` 为 `["app"]`。`main.rs` 的实际文件名以探测结果为准，不写死。
+
 ### 13.4 CLI 增补
 
 ```text
@@ -301,7 +314,11 @@ dbmig env run    -in <包.dbm> -out <目录>        # unpack + compose build + �
 
 ### 13.6 Rust 验收用例
 
-`testdata/sample_rust/`：
+当前源项目还没有 Rust 文件，验收时现场配置。工具不预先假设路径，现场执行 `env detect`。
+
+两种样例：
+
+A. Cargo 项目
 
 ```text
 rust-toolchain.toml
@@ -310,15 +327,21 @@ Cargo.lock
 src/main.rs        # 输出 hello from rust
 ```
 
-验收步骤：
+B. 单文件
 
-1. `dbmig env detect -src testdata/sample_rust` 生成正确的 `runtime.json`
-2. `dbmig pack -src testdata/sample_rust -out rust.dbm --with-env --with-image`
+```text
+main.rs            # 输出 hello from rust
+```
+
+验收步骤（两种模式相同）：
+
+1. 现场在源项目目录执行 `dbmig env detect -src <目录>`，确认 `runtime.json` 的 `runtime` 为 `rust-cargo` 或 `rust-single`
+2. `dbmig pack -src <目录> -out rust.dbm --with-env --with-image`
 3. 目标机器只装 Docker，不装 Rust
 4. `dbmig env run -in rust.dbm -out restored`
 5. 输出 `hello from rust`，退出码 0
 
-判定：源项目和目标容器输出逐字节一致，即验收通过。
+判定：源项目和目标容器输出逐字节一致，即验收通过；Cargo 和单文件各跑一次。
 
 ### 13.7 密钥与 secret 边界
 
@@ -331,11 +354,11 @@ src/main.rs        # 输出 hello from rust
 
 | 里程碑 | 内容 | 验收 |
 |---|---|---|
-| M-B（先做） | Rust 环境探测、Dockerfile 生成、镜像构建、目标侧运行 | `hello from rust` |
-| M-A | Agent 数据/四层记忆 pack/inspect/unpack | 带口令完整还原 |
+| M-A（先做） | Agent 数据/四层记忆 pack/inspect/unpack | 带口令完整还原 |
+| M-B | Rust 环境探测、Dockerfile 生成、镜像构建、目标侧运行 | Cargo 与单文件均可运行 |
 | M-C | 合并成一个 `.dbm` + 官方导入 | 目标账号人工验收 |
 
-先做 M-B 的原因：验收标准是环境可运行，先把 Docker 链路跑通，避免 Go 代码写了却卡在平台/镜像能力上。
+先做 M-A 的原因：当前没有现成的 Rust 源项目，环境部分等验收时现场配置；先把不依赖 Docker 的数据/记忆闭环跑通。目标平台的镜像导入能力未知，M-B 先在本地 Docker 验证，平台实测放到 M-C。
 
 ### 13.9 目录规划增补
 
@@ -349,19 +372,27 @@ testdata/sample_rust/    Rust 验收样例
 
 ### 13.10 学习路线调整
 
-在原有 Go 课之后补两节：
+调整后的顺序：1-8 不变，第 9 课仍是 `go test`；新增第 10 课，原第 10 课顺延。
 
 | 课 | 内容 | 用途 |
 |---|---|---|
+| 9 | `go test` | 给探测和打包逻辑写测试 |
 | 10 | `os/exec` + `flag` | 调用 `docker build/save/load/run`，解析命令行 |
-| 11 | `go test`（可选） | 给探测和打包逻辑写测试 |
+| 11 | `goroutine/channel`（选学） | 并行打包 / 进度输出 |
 
 Docker 基础单独做一次实战，不计入 Go 课：只学 `Dockerfile`、`compose.yaml`、`docker build/run/save/load` 五个点。
 
-### 13.11 待确认
+### 13.11 已确认与待实测
+
+已确认（2026-10-25）：
+
+- 第一版先做 M-A（Agent 数据/记忆），M-B 环境迁移后置
+- 源项目当前没有 Rust 文件，验收时现场配置；工具只负责现场探测，不预置样例
+- Rust 验收同时覆盖 Cargo 项目和单文件脚本
+- 目标平台导入能力未知，先做本地 Docker Demo
+
+待实测：
 
 1. 飞书账号里的豆包工作是否支持导入自定义 Docker 镜像或环境模板？
-2. 源项目环境能否拿到 Dockerfile/Compose；如果只有云端沙箱，能否导出快照或文件清单？
-3. 目标机器/沙箱是否允许运行 Docker？
-4. Rust 验收是 Cargo 项目（`cargo run`），还是单文件脚本（`rustc main.rs`）？
-5. 迁移包是否有大小限制，是否需要默认不打包镜像、只传 Dockerfile？
+2. 目标机器/沙箱是否允许运行 Docker？
+3. 迁移包是否有大小限制，是否需要默认不打包镜像、只传 Dockerfile？
