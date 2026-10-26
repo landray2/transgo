@@ -396,3 +396,151 @@ Docker 基础单独做一次实战，不计入 Go 课：只学 `Dockerfile`、`c
 1. 飞书账号里的豆包工作是否支持导入自定义 Docker 镜像或环境模板？
 2. 目标机器/沙箱是否允许运行 Docker？
 3. 迁移包是否有大小限制，是否需要默认不打包镜像、只传 Dockerfile？
+
+## 14. 隐私标签与完整性校验（2026-10-26 增补）
+
+### 14.1 参考边界
+
+蚂蚁阿福的公开材料只披露控制面，没有披露“记忆写入时打标签”的内部实现。可确认的是：
+
+- 记忆是结构化存储，用户可在【记忆】中查看、管理，授权后用于个性化回复
+- 健康生理信息属于敏感个人信息，需要单独同意
+- “无痕拍/无痕模式”下照片打码，对话结束自动清除，不进历史记录
+- 信通院“卓越型”认证强调全链路防护与查询/更正/删除权利
+
+因此本工具不假设源项目一定带隐私标签，必须同时支持：**显式标签、策略默认、检测器推断、完全无标签**。
+
+### 14.2 PrivacyEnvelope
+
+每条记录（对话、记忆、工作流、文件）外层统一包一个隐私信封：
+
+```go
+type Level int
+
+const (
+	Unknown Level = iota
+	Public
+	Internal
+	Sensitive
+	Restricted
+)
+
+type Verdict struct {
+	Level      Level
+	Confidence float64
+	Source     string // explicit / policy / detector
+	Version    string
+	Evidence   string
+}
+
+type PrivacyEnvelope struct {
+	Level      Level     // 最终生效等级
+	Declared   Level     // 源记录自带的等级，仅作参考
+	Verdicts   []Verdict // 所有来源的裁决记录
+	Ephemeral  bool      // 无痕记录，默认不导出
+	Quarantine bool      // 未知等级，进入隔离区
+}
+```
+
+裁决规则：
+
+1. 显式标签作为 `Declared`，不无条件信任
+2. 依次运行策略默认值和检测器，取**最高等级**，失败关闭
+3. 显式低等级与检测高等级冲突时，按高等级处理并记录冲突
+4. 无标签且无可靠推断 → `Unknown` → `Quarantine`，默认不迁移
+5. `Ephemeral` 走单独路径，默认不打包；需要导出时必须显式确认
+6. **目标侧重新评估**：源标签不可信，目标策略更严时以目标为准
+7. `Sensitive` / `Restricted` 的长期记忆必须同时具备密钥和显式同意
+
+### 14.3 可插拔 Gate
+
+```go
+type Tagger interface {
+	Name() string
+	Tag(ctx context.Context, r Record) (Verdict, error)
+}
+
+type Gate struct {
+	Taggers           []Tagger
+	Default           Level
+	QuarantineUnknown bool
+}
+```
+
+- 具体用哪些 Tagger 由配置决定，不在代码里写死
+- 每个裁决记录 `tagger 名称 + 版本 + 置信度 + 证据`，保证结果可复现
+- 需要降级时生成待审批项，不静默降级
+- 隔离区输出 `quarantine/` 和清单，用户确认后再进入迁移流程
+
+### 14.4 完整性通道
+
+“逐字节一致”只对没有被解码/重编码的数据成立。清单中每个条目必须声明校验通道：
+
+| 通道 | 适用对象 | 校验方式 | 能否逐字节 |
+|---|---|---|---|
+| `raw` | 附件、Rust 源码、原始 JSON blob、Dockerfile/compose/lockfile | `SHA-256(raw bytes)`，源/目标对比 | **能** |
+| `canonical-json` | 需要转成目标 schema 的结构化记录、对话、记忆条目 | RFC 8785 JSON 规范化后 `SHA-256` | 不能，承诺规范化等价 |
+| `semantic` | 目标会改写、摘要、重排的内容 | 字段断言 + 抽样比对 | 不能，只承诺语义 |
+
+补充规则：
+
+- 加密数据比**明文哈希**，不比密文；记录 `plaintext_sha256`、`key_id`、`cipher_suite`、`aad_hash`
+- Docker 环境不承诺镜像字节一致：`Dockerfile/compose/lockfile` 走 `raw`，镜像比 `config digest` 与 `diffID`，最终用 `rustc --version` 和脚本输出哈希验收
+- 每个条目记录 `hash_mode`、`source_sha256`、`target_sha256`、`status`
+- 所有条目哈希排序后计算 Merkle root，再用迁移密钥做 HMAC 签名，防篡改
+- `verify` 必须独立读取目标侧并重算，不能只信任导出侧写入的哈希
+
+### 14.5 manifest 增补字段
+
+第 4 节的 `manifest.json` 增加：
+
+```json
+{
+  "privacy_policy": {
+    "levels": ["public", "internal", "sensitive", "restricted"],
+    "unknown_action": "quarantine",
+    "ephemeral_export": false
+  },
+  "items": [
+    {
+      "id": "mem-001",
+      "hash_mode": "canonical-json",
+      "source_sha256": "...",
+      "target_sha256": "...",
+      "status": "matched",
+      "privacy": {
+        "level": "sensitive",
+        "declared": "internal",
+        "ephemeral": false,
+        "sources": ["explicit", "detector:pii"]
+      }
+    }
+  ],
+  "merkle_root": "...",
+  "manifest_hmac": "..."
+}
+```
+
+### 14.6 验收报告
+
+`verify` 输出必须分通道统计，不能只给一个总数：
+
+```text
+raw:        128 items, 128 matched, 100%
+canonical:  942 items, 942 matched, 100%
+semantic:    37 items,  35 passed, 2 need review
+quarantine:  11 items, not migrated (unknown label)
+```
+
+验收结论明确写成：**raw 通道逐字节一致；canonical 通道规范化等价；semantic 通道语义一致；隔离区未迁移。** 不把“语义一致”包装成“逐字节一致”。
+
+### 14.7 目录增补
+
+```text
+internal/privacy/    Tagger 实现、Gate、策略配置
+internal/integrity/  哈希、规范化 JSON、Merkle、清单签名
+internal/verify/     独立读取目标侧并重算
+```
+
+M-A 阶段先落 `raw` + `canonical-json` 两个通道；`semantic` 和目标侧复评在 M-C 接入官方导入后补齐。
+
